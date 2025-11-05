@@ -29,9 +29,6 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           EMAIL_TO:           ${{ secrets.EMAIL_TO }}
           BS_TAGS:            ${{ secrets.BS_TAGS }}
-          BS_MIN_SCORE:       ${{ secrets.BS_MIN_SCORE }}
-          BS_MAX_PER_RUN:     ${{ secrets.BS_MAX_PER_RUN }}
-          DRY_RUN:            ${{ secrets.DRY_RUN }}
         run: python beatsaver-watch.py
 
       - name: Commit state if changed
