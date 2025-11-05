@@ -1,4 +1,3 @@
-
 import os, json, smtplib, ssl
 from pathlib import Path
 from datetime import datetime, timezone
@@ -190,4 +189,74 @@ def build_email(items, tags_label):
     return subject, plain_text, html_body
 
 def send_email(items, tags_label):
-    subject, pl
+    subject, plain_text, html_body = build_email(items, tags_label)
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = GMAIL_USER
+    msg["To"] = EMAIL_TO
+    msg.set_content(plain_text)
+    msg.add_alternative(html_body, subtype="html")
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
+        smtp.starttls(context=ctx)
+        smtp.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        smtp.send_message(msg)
+
+# ---------- MAIN ----------
+def main():
+    state = load_state()
+    last_seen = datetime.fromisoformat(state["last_seen"]) if state.get("last_seen") else None
+    seen_ids = set(state.get("seen_ids", []))
+
+    # 1) fetch latest
+    try:
+        docs = fetch_latest_pages(PAGES_TO_FETCH)
+    except Exception as e:
+        print("[bs] ERROR fetching:", repr(e))
+        docs = []
+
+    # 2) filter by tags (client-side)
+    docs = filter_by_tags(docs, BS_TAGS)
+
+    # 3) normalize + optional score filter
+    items = [normalize_doc(d) for d in docs]
+    if BS_MIN_SCORE > 0:
+        items = [x for x in items if (x["score"] is not None and x["score"] >= BS_MIN_SCORE)]
+
+    # 4) dedup (GUID-first) + optional watermark
+    new_items = []
+    for it in items:
+        vid = it["id"]
+        if not vid or vid in seen_ids:
+            continue
+        # If you want a strict time guard, uncomment next two lines:
+        # if last_seen and it["created_at"] and not (it["created_at"] > last_seen):
+        #     continue
+        new_items.append(it)
+
+    if BS_MAX_PER_RUN > 0:
+        new_items = new_items[:BS_MAX_PER_RUN]
+
+    # 5) email
+    tags_label = ", ".join(BS_TAGS) if BS_TAGS else "Latest"
+    if new_items and not DRY_RUN:
+        send_email(new_items, tags_label)
+
+    # 6) update state (max created_at; only IDs we emailed)
+    max_ts = max((it["created_at"] for it in items if it["created_at"]), default=last_seen)
+    now_utc = datetime.now(timezone.utc)
+    if max_ts and max_ts > now_utc:
+        max_ts = now_utc
+    if max_ts:
+        state["last_seen"] = max_ts.isoformat()
+
+    for it in new_items:
+        if it["id"]:
+            seen_ids.add(it["id"])
+    state["seen_ids"] = list(seen_ids)[-20000:]
+    save_state(state)
+
+    print(f"[bs] done: fetched={len(docs)}, filtered={len(items)}, new={len(new_items)}, seen_total={len(state['seen_ids'])}, dry_run={DRY_RUN}")
+
+if __name__ == "__main__":
+    main()
