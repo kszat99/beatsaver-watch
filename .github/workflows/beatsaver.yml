@@ -1,1 +1,50 @@
+name: BeatSaver Watch (Daily)
+
+on:
+  schedule:
+    - cron: "05 7 * * *"   # daily at 07:05 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run BeatSaver watcher
+        env:
+          GMAIL_USER:         ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_TO:           ${{ secrets.EMAIL_TO }}
+          BS_TAGS:            ${{ secrets.BS_TAGS }}
+          BS_MIN_SCORE:       ${{ secrets.BS_MIN_SCORE }}
+          BS_MAX_PER_RUN:     ${{ secrets.BS_MAX_PER_RUN }}
+          DRY_RUN:            ${{ secrets.DRY_RUN }}
+        run: python beatsaver_watch.py
+
+      - name: Commit state if changed
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -n "$(git status --porcelain data/bs_state.json)" ]; then
+            git add data/bs_state.json
+            git commit -m "Update bs_state.json [skip ci]"
+            git pull --rebase || true
+            git push
+          else
+            echo "No changes to commit."
+          fi
 
