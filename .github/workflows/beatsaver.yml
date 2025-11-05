@@ -32,7 +32,7 @@ jobs:
           BS_MIN_SCORE:       ${{ secrets.BS_MIN_SCORE }}
           BS_MAX_PER_RUN:     ${{ secrets.BS_MAX_PER_RUN }}
           DRY_RUN:            ${{ secrets.DRY_RUN }}
-        run: python beatsaver_watch.py
+        run: python beatsaver-watch.py
 
       - name: Commit state if changed
         if: always()
