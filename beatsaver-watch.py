@@ -1,13 +1,29 @@
+# beatsaver_watch.py — search-by-tags only, de-duped, preview=3
+
 import os, json, smtplib, ssl
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 import requests
 
-# ---------- ENV ----------
+# ---------- ENV (robust parsing) ----------
+def _get_float_env(name, default):
+    val = os.environ.get(name, "")
+    try:
+        return float(val.strip())
+    except Exception:
+        return default
+
+def _get_int_env(name, default):
+    val = os.environ.get(name, "")
+    try:
+        return int(val.strip())
+    except Exception:
+        return default
+
 BS_TAGS = [t.strip().lower() for t in os.environ.get("BS_TAGS", "").split(",") if t.strip()]
-BS_MIN_SCORE = float(os.environ.get("BS_MIN_SCORE", "0"))        # e.g., 0.80 keeps ≥80%
-BS_MAX_PER_RUN = int(os.environ.get("BS_MAX_PER_RUN", "50"))     # cap results per email (0 = no cap)
+BS_MIN_SCORE   = _get_float_env("BS_MIN_SCORE", 0.0)   # 0.0 = no rating filter
+BS_MAX_PER_RUN = _get_int_env("BS_MAX_PER_RUN", 50)    # 0 = no cap
 DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
 
 GMAIL_USER = os.environ["GMAIL_USER"]
@@ -16,9 +32,14 @@ EMAIL_TO = os.environ["EMAIL_TO"]
 
 STATE_PATH = Path("data/bs_state.json")
 
+# BeatSaver API
 API_BASE = "https://api.beatsaver.com"
-LATEST_ENDPOINT = "/maps/latest"   # supports ?page=<0..>
-PAGES_TO_FETCH = 5                 # how many "latest" pages to scan each run
+SEARCH_ENDPOINT = "/search/text/{page}"   # Solr-backed search
+
+# Behavior
+CUTOFF_DAYS_BOOTSTRAP = 7     # first run: look back 7 days
+MAX_PAGES_HARD_LIMIT  = 20    # safety cap
+PREVIEW_LAST_N        = 3     # show last 3 if no new
 
 # ---------- STATE ----------
 def load_state():
@@ -37,7 +58,7 @@ def iso_to_dt(s):
     if not s:
         return None
     try:
-        # BeatSaver returns ISO with 'Z'
+        # BeatSaver returns ISO with Z
         return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
     except Exception:
         return None
@@ -56,18 +77,46 @@ def percent(x):
     except Exception:
         return "—"
 
-def fetch_latest_pages(pages=PAGES_TO_FETCH):
-    headers = {"User-Agent": "beatsaver-watch/1.0 (+github actions)"}
+# ---------- FETCH (SEARCH BY TAGS) ----------
+def fetch_search_by_tags(tags, cutoff_dt, max_pages=MAX_PAGES_HARD_LIMIT):
+    """
+    Use /search/text/{page}?q=<query>&sortOrder=Latest to pull maps that match your tags.
+    We still verify tags client-side and stop when oldest result is older than cutoff.
+    """
+    headers = {
+        "User-Agent": "beatsaver-watch/1.0 (+github actions)",
+        "Accept": "application/json"
+    }
+    # Simple OR-style query: "rock metal" (server-side text search).
+    q = " ".join(tags) if tags else ""
     out = []
-    for page in range(pages):
-        url = f"{API_BASE}{LATEST_ENDPOINT}?page={page}"
-        r = requests.get(url, headers=headers, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        out.extend(data.get("docs", []) or [])
+    for page in range(max_pages):
+        url = f"{API_BASE}{SEARCH_ENDPOINT.format(page=page)}"
+        params = {"q": q, "sortOrder": "Latest"}
+        r = requests.get(url, headers=headers, params=params, timeout=20)
+        try:
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            print(f"[bs] search page={page} ERROR {getattr(r,'status_code','NA')}: {repr(e)}")
+            break
+
+        docs = data.get("docs", []) or []
+        print(f"[bs] search page={page} docs={len(docs)}")
+        if not docs:
+            break
+
+        out.extend(docs)
+
+        # Stop early if the last (oldest) doc on this page is older than cutoff
+        tail = docs[-1]
+        tail_created = iso_to_dt(tail.get("createdAt")) or iso_to_dt(tail.get("uploaded")) or iso_to_dt(tail.get("lastPublishedAt"))
+        if cutoff_dt and tail_created and tail_created < cutoff_dt:
+            break
     return out
 
 def filter_by_tags(docs, tags_lower):
+    """Safety net: verify tags explicitly client-side."""
     if not tags_lower:
         return docs
     keep = []
@@ -78,7 +127,7 @@ def filter_by_tags(docs, tags_lower):
     return keep
 
 def normalize_doc(d):
-    """Shrink BeatSaver doc to just what we need."""
+    """Shrink BeatSaver doc to the fields we need."""
     vid = d.get("id")
     name = d.get("name") or ""
     uploader = (d.get("uploader") or {}).get("name") or ""
@@ -126,6 +175,7 @@ def normalize_doc(d):
         "beatsaver_url": f"https://beatsaver.com/maps/{vid}" if vid else "",
     }
 
+# ---------- EMAIL ----------
 def build_email(items, tags_label):
     if items:
         subject = f"[BeatSaver] {len(items)} new map(s) for: {tags_label}"
@@ -208,41 +258,53 @@ def main():
     last_seen = datetime.fromisoformat(state["last_seen"]) if state.get("last_seen") else None
     seen_ids = set(state.get("seen_ids", []))
 
-    # 1) fetch latest
+    # Cutoff: last_seen if present, else now-7d
+    cutoff_dt = last_seen or (datetime.now(timezone.utc) - timedelta(days=CUTOFF_DAYS_BOOTSTRAP))
+
+    # 1) Fetch via SEARCH (tag-focused)
     try:
-        docs = fetch_latest_pages(PAGES_TO_FETCH)
+        raw_docs = fetch_search_by_tags(BS_TAGS, cutoff_dt, max_pages=MAX_PAGES_HARD_LIMIT)
     except Exception as e:
         print("[bs] ERROR fetching:", repr(e))
-        docs = []
+        raw_docs = []
 
-    # 2) filter by tags (client-side)
-    docs = filter_by_tags(docs, BS_TAGS)
+    # 2) Safety: filter by tags client-side anyway
+    docs = filter_by_tags(raw_docs, BS_TAGS)
 
-    # 3) normalize + optional score filter
+    # 3) Normalize + optional score filter
     items = [normalize_doc(d) for d in docs]
     if BS_MIN_SCORE > 0:
         items = [x for x in items if (x["score"] is not None and x["score"] >= BS_MIN_SCORE)]
 
-    # 4) dedup (GUID-first) + optional watermark
+    # 4) Precise cutoff filter
+    if cutoff_dt:
+        items = [it for it in items if not it["created_at"] or it["created_at"] >= cutoff_dt]
+
+    # 5) De-dup within run (multi-tag hits) + across runs
+    run_seen = set()
     new_items = []
     for it in items:
         vid = it["id"]
-        if not vid or vid in seen_ids:
+        if not vid or vid in seen_ids or vid in run_seen:
             continue
-        # If you want a strict time guard, uncomment next two lines:
-        # if last_seen and it["created_at"] and not (it["created_at"] > last_seen):
-        #     continue
+        run_seen.add(vid)
         new_items.append(it)
 
+    # 6) Cap if configured
     if BS_MAX_PER_RUN > 0:
         new_items = new_items[:BS_MAX_PER_RUN]
 
-    # 5) email
     tags_label = ", ".join(BS_TAGS) if BS_TAGS else "Latest"
+
+    # 7) Email new, else preview last 3
     if new_items and not DRY_RUN:
         send_email(new_items, tags_label)
+    elif not new_items and not DRY_RUN:
+        preview = items[:PREVIEW_LAST_N]
+        if preview:
+            send_email(preview, tags_label + " (preview)")
 
-    # 6) update state (max created_at; only IDs we emailed)
+    # 8) Advance watermark (max created_at we saw; clamp to now)
     max_ts = max((it["created_at"] for it in items if it["created_at"]), default=last_seen)
     now_utc = datetime.now(timezone.utc)
     if max_ts and max_ts > now_utc:
@@ -250,13 +312,14 @@ def main():
     if max_ts:
         state["last_seen"] = max_ts.isoformat()
 
+    # 9) Persist memory only for items we emailed
     for it in new_items:
         if it["id"]:
             seen_ids.add(it["id"])
     state["seen_ids"] = list(seen_ids)[-20000:]
     save_state(state)
 
-    print(f"[bs] done: fetched={len(docs)}, filtered={len(items)}, new={len(new_items)}, seen_total={len(state['seen_ids'])}, dry_run={DRY_RUN}")
+    print(f"[bs] done: fetched={len(raw_docs)}, filtered={len(items)}, new={len(new_items)}, seen_total={len(state['seen_ids'])}, cutoff={cutoff_dt.isoformat() if cutoff_dt else 'None'}, dry_run={DRY_RUN}")
 
 if __name__ == "__main__":
     main()
