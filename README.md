@@ -1,2 +1,2 @@
 # beatsaver-watch
-daily email sender showing the latest maps published on beatsaver.com
+daily email sender showing the latest maps published on beatsaver.com, filtered by tags
