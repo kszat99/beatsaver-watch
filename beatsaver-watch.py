@@ -29,7 +29,7 @@ EMAIL_TO = os.environ["EMAIL_TO"]
 STATE_PATH = Path("data/bs_state.json")
 
 API_BASE = "https://api.beatsaver.com"
-LATEST_ENDPOINT = "/maps/latest/{page}"
+LATEST_ENDPOINT = "/maps/latest"
 
 # Behavior
 SEED_COUNT              = 3     # first run: collect at least this many latest tagged maps
@@ -123,8 +123,9 @@ def fetch_latest_for_tag(tag, cutoff_dt, max_pages):
     tag_lc = (tag or "").lower()
     out, seen_page_uids = [], set()
     for page in range(max_pages):
-        url = f"{API_BASE}{LATEST_ENDPOINT.format(page=page)}"
-        r = requests.get(url, headers=headers, timeout=20)
+        url = f"{API_BASE}{LATEST_ENDPOINT}"
+        params = {"page": page}
+        r = requests.get(url, headers=headers, params=params, timeout=20)
         try:
             r.raise_for_status()
             data = r.json()
