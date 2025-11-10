@@ -2,7 +2,7 @@ name: BeatSaver Watch (Daily)
 
 on:
   schedule:
-    - cron: "05 7 * * *"   # daily at 07:05 UTC
+     - cron: "00 7 * * *"   # daily at 07:00 UTC
   workflow_dispatch: {}
 
 permissions:
