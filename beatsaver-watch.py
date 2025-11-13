@@ -29,7 +29,7 @@ def _get_float(name, default):
 
 # Tags to include (comma-separated, e.g. "rock,metal"); empty → all
 BS_TAGS = [t.strip().lower() for t in (os.environ.get("BS_TAGS", "") or "").split(",") if t.strip()]
-# How many pages per tag from /maps/latest?page=...
+# How many pages per tag (or unfiltered) to scan
 BS_MAX_PAGES_PER_TAG = _get_int("BS_MAX_PAGES_PER_TAG", 30)
 # Optional minimum score (0..1). Leave unset/0.0 to disable.
 BS_MIN_SCORE = _get_float("BS_MIN_SCORE", 0.0)
@@ -45,7 +45,8 @@ DRY_RUN            = (os.environ.get("DRY_RUN", "0") == "1")       # if 1 → no
 STATE_PATH = Path("data/bs_state.json")
 
 API_BASE = "https://api.beatsaver.com"
-LATEST_ENDPOINT = "/maps/latest"  # use ?page=<n>
+LATEST_ENDPOINT = "/maps/latest"      # ?page=<n>
+SEARCH_TEXT_ENDPOINT = "/search/text" # /search/text/<page>?q=...&sort=LATEST
 
 # ========================
 # State (JSON)
@@ -135,41 +136,66 @@ def normalize_doc(d):
         "preview": v0.get("previewURL") or "",
         "difficulties": diffs,
         "beatsaver_url": f"https://beatsaver.com/maps/{d.get('id')}" if d.get("id") else "",
-        "tags": [str(t).lower() for t in (d.get("tags") or [])],
     }
 
 # ========================
-# Fetch (per-tag from latest)
+# Fetch helpers
 # ========================
-def fetch_latest_page(page):
-    headers = {
-        "User-Agent": "beatsaver-watch/1.0 (+github actions)",
+def _headers():
+    return {
+        "User-Agent": "beatsaver-watch/1.1 (+github actions)",
         "Accept": "application/json",
     }
+
+def fetch_latest_page(page):
     url = f"{API_BASE}{LATEST_ENDPOINT}"
-    r = requests.get(url, headers=headers, params={"page": page}, timeout=20)
+    r = requests.get(url, headers=_headers(), params={"page": page}, timeout=20)
+    r.raise_for_status()
+    return r.json().get("docs", []) or []
+
+def fetch_search_text_page(page, query):
+    # query example: "tag=rock" (we rely on server-side tag filtering)
+    url = f"{API_BASE}{SEARCH_TEXT_ENDPOINT}/{page}"
+    r = requests.get(url, headers=_headers(), params={"q": query, "sort": "LATEST"}, timeout=20)
     r.raise_for_status()
     return r.json().get("docs", []) or []
 
 def fetch_merged_latest_for_tags(tags, max_pages):
-    """Fetch newest→older pages for each tag, filter by tag client-side, merge+dedup by uid."""
+    """
+    Preferred path: use /search/text with q='tag=<tag>' so the API filters by tag.
+    If no tags specified, fall back to unfiltered /maps/latest.
+    """
     merged, seen = [], set()
-    tag_list = tags or [""]  # empty string → accept all
-    for tag in tag_list:
-        tag_lc = tag.lower()
+    if tags:
+        for tag in tags:
+            q = f"tag={tag}"
+            for page in range(max_pages):
+                try:
+                    docs = fetch_search_text_page(page, q)
+                except Exception as e:
+                    print(f"[bs] search tag='{tag}' page={page} ERROR: {repr(e)}")
+                    break
+                print(f"[bs] search tag='{tag}' page={page} docs={len(docs)}")
+                if not docs:
+                    break
+                for d in docs:
+                    uid = doc_uid(d)
+                    if uid in seen:
+                        continue
+                    seen.add(uid)
+                    merged.append(d)
+    else:
+        # No tags → just fetch latest unfiltered for the main pool
         for page in range(max_pages):
             try:
                 docs = fetch_latest_page(page)
             except Exception as e:
-                print(f"[bs] latest tag='{tag}' page={page} ERROR: {repr(e)}")
+                print(f"[bs] latest page={page} ERROR: {repr(e)}")
                 break
-            print(f"[bs] latest tag='{tag}' page={page} docs={len(docs)}")
+            print(f"[bs] latest page={page} docs={len(docs)}")
             if not docs:
                 break
             for d in docs:
-                # tag filter
-                if tag_lc and tag_lc not in [str(t).lower() for t in (d.get("tags") or [])]:
-                    continue
                 uid = doc_uid(d)
                 if uid in seen:
                     continue
@@ -260,7 +286,7 @@ def main():
     seen_ids = set(state.get("seen_ids", []))
     tags_label = ", ".join(BS_TAGS) if BS_TAGS else "Latest"
 
-    # Always fetch a pool for this run (used both for "new" and preview)
+    # 1) Fetch a tag-filtered pool (server-side via /search/text)
     raw_docs = fetch_merged_latest_for_tags(BS_TAGS, BS_MAX_PAGES_PER_TAG)
     items_all = [normalize_doc(d) for d in raw_docs]
 
@@ -271,7 +297,7 @@ def main():
     # newest → oldest
     items_all.sort(key=lambda it: it["created_at"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
 
-    # Compute "new" exactly like Letterboxd: created_at > last_seen
+    # 2) Compute "new" exactly like Letterboxd: created_at > last_seen
     if last_seen:
         candidates = [it for it in items_all if (it["created_at"] and it["created_at"] > last_seen) or (not it["created_at"] and it["uid"] not in seen_ids)]
     else:
@@ -287,16 +313,32 @@ def main():
         run_seen.add(uid)
         new_items.append(it)
 
-    # Send new or preview (mirror Letterboxd)
+    # 3) If main pool is empty, build a fallback preview from unfiltered latest (do not consume watermark)
+    fallback_preview = []
+    if not items_all:
+        try:
+            unfiltered = []
+            for page in range(3):  # a few pages are enough for preview
+                docs = fetch_latest_page(page)
+                if not docs:
+                    break
+                unfiltered.extend(docs)
+            items_unfiltered = [normalize_doc(d) for d in unfiltered]
+            items_unfiltered.sort(key=lambda it: it["created_at"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+            fallback_preview = items_unfiltered[:max(PREVIEW_LAST_N, 0)]
+        except Exception as e:
+            print("[bs] fallback preview ERROR:", repr(e))
+
+    # 4) Send new or preview (mirror Letterboxd)
     if new_items and not DRY_RUN:
         send_email(new_items, tags_label, is_preview=False)
     elif not DRY_RUN:
-        # preview from full pool, newest→oldest
-        preview = items_all[:max(PREVIEW_LAST_N, 0)]
+        # preview from full tag pool; if empty, use fallback unfiltered preview
+        preview = items_all[:max(PREVIEW_LAST_N, 0)] if items_all else fallback_preview
         if preview or ALWAYS_EMAIL:
             send_email(preview, tags_label, is_preview=True)
 
-    # Advance watermark to newest timestamp we fetched (clamped to now)
+    # 5) Advance watermark to newest timestamp we fetched in the TAG POOL (clamped to now)
     newest_ts = max((it["created_at"] for it in items_all if it["created_at"]), default=last_seen)
     now_utc = datetime.now(timezone.utc)
     if newest_ts and newest_ts > now_utc:
