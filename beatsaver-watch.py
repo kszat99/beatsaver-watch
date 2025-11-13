@@ -30,7 +30,7 @@ def _get_float(name, default):
 # Tags to include (comma-separated, e.g. "rock,metal"); empty → all
 BS_TAGS = [t.strip().lower() for t in (os.environ.get("BS_TAGS", "") or "").split(",") if t.strip()]
 # How many pages per tag from /maps/latest?page=...
-BS_MAX_PAGES_PER_TAG = _get_int("BS_MAX_PAGES_PER_TAG", 12)
+BS_MAX_PAGES_PER_TAG = _get_int("BS_MAX_PAGES_PER_TAG", 30)
 # Optional minimum score (0..1). Leave unset/0.0 to disable.
 BS_MIN_SCORE = _get_float("BS_MIN_SCORE", 0.0)
 
