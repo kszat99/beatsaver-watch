@@ -1,37 +1,43 @@
-# beatsaver-watch.py — daily BeatSaver watcher with:
-# - priority tags (BS_TAGS)
-# - if no priority-tag maps yesterday → preview latest few with priority tags
-# - always show other maps from yesterday
-# - if literally no maps yesterday → preview-only email
-# - FIXED: BeatSaver uses PACIFIC TIME for “1 day ago”, so we use PT window
+# beatsaver-watch.py
+# FINAL VERSION — CLEAN, CORRECT, AND USING ?before=
+#
+# FEATURES:
+# - Fetch ALL maps uploaded yesterday (UTC), using ?before= for correct pagination.
+# - Split into:
+#       1) Priority maps (tags from BS_TAGS)
+#       2) Other maps
+# - Only if NO priority maps yesterday → preview latest 5 priority-tag maps
+# - NO timezone conversions — strict UTC midnight boundaries
+# - Simple HTML email
 
 import os
-import json
 import smtplib
 import ssl
-from email.message import EmailMessage
-from datetime import datetime, timedelta, timezone
-import zoneinfo
-from pathlib import Path
 import requests
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 
-# ---------------- ENV ----------------
+
+# =======================
+# CONFIG
+# =======================
 
 BS_TAGS = [t.strip().lower() for t in (os.environ.get("BS_TAGS", "") or "").split(",") if t.strip()]
-BS_MAX_PAGES_PER_TAG = int(os.environ.get("BS_MAX_PAGES_PER_TAG", "12"))
+BS_MAX_PAGES = int(os.environ.get("BS_MAX_PAGES", "50"))   # safety cap for pagination
+PREVIEW_COUNT = 5
 BS_MIN_SCORE = float(os.environ.get("BS_MIN_SCORE", "0.0"))
-PREVIEW_LAST_N = int(os.environ.get("PREVIEW_LAST_N", "3"))
-ALWAYS_EMAIL = os.environ.get("ALWAYS_EMAIL", "1") == "1"
-DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
+DRY_RUN = (os.environ.get("DRY_RUN", "0") == "1")
 
 GMAIL_USER = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 EMAIL_TO = os.environ["EMAIL_TO"]
 
-STATE_PATH = Path("data/bs_state.json")
 API_BASE = "https://api.beatsaver.com"
 
-# ---------------- HELPERS ----------------
+
+# =======================
+# HELPERS
+# =======================
 
 def iso_to_dt(s):
     if not s:
@@ -41,113 +47,78 @@ def iso_to_dt(s):
     except:
         return None
 
-def doc_uid(d):
-    if d.get("id"):
-        return str(d["id"])
-    v = (d.get("versions") or [])
-    if v:
-        return str(v[0].get("key") or v[0].get("hash") or "")
-    return f"{d.get('name','')}|{d.get('createdAt','')}"
 
-def normalize_doc(d):
-    md = d.get("metadata") or {}
-    stats = d.get("stats") or {}
-    versions = d.get("versions") or []
+def normalize(doc):
+    """Return flattened map info with created_at and tags."""
+    md = doc.get("metadata") or {}
+    stats = doc.get("stats") or {}
+    versions = doc.get("versions") or []
     v0 = versions[0] if versions else {}
 
     created = (
-        iso_to_dt(d.get("createdAt"))
-        or iso_to_dt(d.get("uploaded"))
-        or iso_to_dt(d.get("lastPublishedAt"))
+        iso_to_dt(doc.get("createdAt"))
+        or iso_to_dt(doc.get("uploaded"))
+        or iso_to_dt(doc.get("lastPublishedAt"))
     )
 
-    uploader = (d.get("uploader") or {}).get("name") or md.get("levelAuthorName") or ""
-
-    diffs = []
-    for df in (v0.get("diffs") or []):
-        diff = df.get("difficulty") or ""
-        diff = diff.replace("ExpertPlus", "Expert+")
-        char = df.get("characteristic") or "Standard"
-        diffs.append(diff if char == "Standard" else f"{diff} ({char})")
-
-    tags_raw = [str(t).strip() for t in (d.get("tags") or []) if str(t).strip()]
+    tags_raw = [str(t).strip() for t in (doc.get("tags") or []) if str(t).strip()]
     tags_lower = [t.lower() for t in tags_raw]
 
     return {
-        "uid": doc_uid(d),
-        "id": d.get("id"),
-        "name": d.get("name") or "",
-        "uploader": uploader,
-        "bpm": md.get("bpm"),
-        "duration": md.get("duration"),
-        "score": stats.get("score"),
-        "upvotes": stats.get("upvotes"),
-        "downvotes": stats.get("downvotes"),
+        "id": doc.get("id"),
+        "name": doc.get("name") or "",
         "created_at": created,
-        "cover": v0.get("coverURL") or "",
-        "download": v0.get("downloadURL") or "",
-        "preview": v0.get("previewURL") or "",
-        "difficulties": diffs,
-        "beatsaver_url": f"https://beatsaver.com/maps/{d.get('id')}" if d.get("id") else "",
-        "tags": tags_raw,
         "tags_lower": tags_lower,
+        "beatsaver_url": f"https://beatsaver.com/maps/{doc.get('id')}" if doc.get("id") else "",
+        "score": stats.get("score"),
     }
 
-def fetch_latest_page(page):
-    r = requests.get(
-        f"{API_BASE}/maps/latest",
-        headers={"User-Agent": "beatsaver-watch"},
-        params={"page": page},
-        timeout=20
-    )
-    r.raise_for_status()
-    return r.json().get("docs") or []
 
-def fetch_until(start_utc, max_pages):
-    merged = []
-    stop = False
+def fetch_latest(before_timestamp, max_pages):
+    """
+    Fetch /maps/latest pages until timestamps fall below a cutoff.
+    """
+    results = []
+    before = before_timestamp
+
     for page in range(max_pages):
-        if stop:
-            break
-        try:
-            docs = fetch_latest_page(page)
-        except:
-            break
+        r = requests.get(
+            f"{API_BASE}/maps/latest",
+            params={"before": before},
+            headers={"User-Agent": "beatsaver-watch"},
+            timeout=20
+        )
+        r.raise_for_status()
+        docs = r.json().get("docs") or []
         if not docs:
             break
-        for d in docs:
-            c = (
-                iso_to_dt(d.get("createdAt"))
-                or iso_to_dt(d.get("uploaded"))
-                or iso_to_dt(d.get("lastPublishedAt"))
-            )
-            if c and c < start_utc:
-                stop = True
-                break
-            merged.append(d)
-    return merged
 
-def get_tag_preview(tag_set, limit):
-    out = []
-    for page in range(5):
-        try:
-            docs = fetch_latest_page(page)
-        except:
-            break
-        if not docs:
-            break
         for d in docs:
-            it = normalize_doc(d)
-            if set(it["tags_lower"]).intersection(tag_set):
-                out.append(it)
-        if len(out) >= limit:
+            results.append(d)
+
+        # pagination: next BEFORE = last map timestamp
+        last = docs[-1]
+        last_created = (
+            iso_to_dt(last.get("createdAt"))
+            or iso_to_dt(last.get("uploaded"))
+            or iso_to_dt(last.get("lastPublishedAt"))
+        )
+
+        # if no timestamp, break
+        if not last_created:
             break
-    out.sort(key=lambda it: it["created_at"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
-    return out[:limit]
+
+        # update BEFORE with last timestamp
+        before = last_created.isoformat()
+
+    return results
+
 
 def send_email(subject, plain, html):
     if DRY_RUN:
-        print("[DRY RUN]", subject)
+        print("\n[DRY RUN EMAIL]")
+        print(subject)
+        print(html)
         return
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -155,79 +126,79 @@ def send_email(subject, plain, html):
     msg["To"] = EMAIL_TO
     msg.set_content(plain)
     msg.add_alternative(html, subtype="html")
+
     ctx = ssl.create_default_context()
     with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
         smtp.starttls(context=ctx)
         smtp.login(GMAIL_USER, GMAIL_APP_PASSWORD)
         smtp.send_message(msg)
 
-# ---------------- MAIN ----------------
+
+# =======================
+# MAIN LOGIC
+# =======================
 
 def main():
+
+    # ----- UTC "yesterday" window -----
     now_utc = datetime.now(timezone.utc)
+    today = now_utc.date()
+    yesterday = today - timedelta(days=1)
 
-    # ---- FIX: BeatSaver's “1 day ago” uses PACIFIC TIME ----
-    PT = zoneinfo.ZoneInfo("America/Los_Angeles")
-    now_pt = now_utc.astimezone(PT)
-    today_pt = now_pt.date()
-    yesterday_pt = today_pt - timedelta(days=1)
+    start_utc = datetime(yesterday.year, yesterday.month, yesterday.day, tzinfo=timezone.utc)
+    end_utc   = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
 
-    start_pt = datetime(yesterday_pt.year, yesterday_pt.month, yesterday_pt.day, tzinfo=PT)
-    end_pt = datetime(today_pt.year, today_pt.month, today_pt.day, tzinfo=PT)
+    print("[debug] start_utc =", start_utc)
+    print("[debug] end_utc   =", end_utc)
 
-    start_utc = start_pt.astimezone(timezone.utc)
-    end_utc = end_pt.astimezone(timezone.utc)
+    # ----- Fetch maps using ?before= for correct pagination -----
+    raw = fetch_latest(end_utc.isoformat(), BS_MAX_PAGES)
+    print("[debug] fetched raw count:", len(raw))
 
-    # Fetch enough latest pages until we reach "yesterday pt"
-    raw_docs = fetch_until(start_utc, BS_MAX_PAGES_PER_TAG)
-    items = [normalize_doc(d) for d in raw_docs]
+    # ----- Normalize -----
+    items = [normalize(d) for d in raw]
 
     # Score filter
     if BS_MIN_SCORE > 0:
         items = [i for i in items if i["score"] and i["score"] >= BS_MIN_SCORE]
 
-    # Maps inside yesterday window
-    items_yest = [
+    # ----- Extract only maps from yesterday -----
+    yest = [
         it for it in items
         if it["created_at"] and start_utc <= it["created_at"] < end_utc
     ]
+    yest.sort(key=lambda x: x["created_at"], reverse=True)
 
-    # Safety net: sometimes maps show as "1 day ago" but have timestamp slightly after midnight UTC
-    # Include maps up to +2 hours after end_utc
-    fudge_end = end_utc + timedelta(hours=2)
-    if not items_yest:
-        items_yest = [
-            it for it in items
-            if it["created_at"] and start_utc <= it["created_at"] < fudge_end
-        ]
+    print("[debug] yesterday map count:", len(yest))
 
-    items_yest.sort(key=lambda it: it["created_at"], reverse=True)
-
-    tag_set = set(BS_TAGS)
+    # ----- Split into priority and others -----
+    tagset = set(BS_TAGS)
     priority = []
     others = []
 
-    for it in items_yest:
-        if tag_set and set(it["tags_lower"]).intersection(tag_set):
+    for it in yest:
+        if tagset and set(it["tags_lower"]).intersection(tagset):
             priority.append(it)
         else:
             others.append(it)
 
-    # Per-tag preview if no priority yesterday
-    priority_preview = []
-    if tag_set and not priority:
-        priority_preview = get_tag_preview(tag_set, PREVIEW_LAST_N)
+    # ----- Preview logic (OPTION B) -----
+    preview = []
+    if not priority and tagset:
+        print("[debug] No priority maps yesterday. Fetching preview...")
+        raw_preview = fetch_latest(end_utc.isoformat(), 20)
+        norm_preview = [normalize(d) for d in raw_preview]
 
-    # If nothing at all
-    if not items_yest:
-        if not priority_preview and tag_set:
-            priority_preview = get_tag_preview(tag_set, PREVIEW_LAST_N)
-        subject = f"[BeatSaver] No new maps for {yesterday_pt}"
-        send_email(subject, subject, f"<p>{subject}</p>")
-        return
+        for it in norm_preview:
+            if set(it["tags_lower"]).intersection(tagset):
+                preview.append(it)
+            if len(preview) >= PREVIEW_COUNT:
+                break
 
-    # ---------- Build Email ----------
-    html = f"<h1>BeatSaver – {yesterday_pt}</h1>"
+    # ----- Build Email -----
+    subject = f"[BeatSaver] {len(yest)} new maps for {yesterday}"
+
+    html = f"<h1>BeatSaver – {yesterday}</h1>"
 
     # Priority section
     html += "<h2>Priority maps</h2>"
@@ -235,20 +206,26 @@ def main():
         for it in priority:
             html += f"<p>🎵 <a href='{it['beatsaver_url']}'>{it['name']}</a></p>"
     else:
-        html += "<p>No new priority-tag maps yesterday. Latest ones:</p>"
-        for it in priority_preview:
-            html += f"<p>🎵 <a href='{it['beatsaver_url']}'>{it['name']}</a></p>"
+        html += "<p>No priority maps yesterday.</p>"
+        if preview:
+            html += "<p>Latest priority-tag maps:</p>"
+            for it in preview:
+                html += f"<p>🎵 <a href='{it['beatsaver_url']}'>{it['name']}</a></p>"
 
     # Other maps
-    html += "<h2>Other maps from yesterday</h2>"
+    html += "<h2>Other maps yesterday</h2>"
     if others:
         for it in others:
             html += f"<p>🎵 <a href='{it['beatsaver_url']}'>{it['name']}</a></p>"
     else:
         html += "<p>No other maps yesterday.</p>"
 
-    subject = f"[BeatSaver] {len(items_yest)} new maps for {yesterday_pt}"
-    send_email(subject, subject, html)
+    # Plaintext is simple
+    plain = subject
+
+    # ----- SEND -----
+    send_email(subject, plain, html)
+
 
 if __name__ == "__main__":
     main()
