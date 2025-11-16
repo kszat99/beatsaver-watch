@@ -31,13 +31,8 @@ def _get_float(name, default):
         return default
 
 BS_TAGS = [t.strip().lower() for t in (os.environ.get("BS_TAGS", "") or "").split(",") if t.strip()]
-
-# New — how many pages maximum to scan with ?before=
 BS_MAX_PAGES = _get_int("BS_MAX_PAGES", 50)
-
-# Preview count explicitly set to 5 per your request
 PREVIEW_LAST_N = 5
-
 BS_MIN_SCORE = _get_float("BS_MIN_SCORE", 0.0)
 
 # Email
@@ -51,7 +46,7 @@ LATEST_ENDPOINT = "/maps/latest"
 
 
 # ========================
-# Helpers (UNCHANGED)
+# Helpers
 # ========================
 def iso_to_dt(s):
     if not s:
@@ -86,6 +81,8 @@ def doc_uid(d):
                 return str(v0[k])
     return f"{d.get('name','')}|{d.get('createdAt','')}"
 
+
+# =============== CRITICAL FIX — ADDED TAGS + TAGS_LOWER =================
 def normalize_doc(d):
     uid = doc_uid(d)
     md = d.get("metadata") or {}
@@ -93,7 +90,12 @@ def normalize_doc(d):
     versions = d.get("versions") or []
     v0 = versions[0] if versions else {}
 
-    created = iso_to_dt(d.get("createdAt")) or iso_to_dt(d.get("uploaded")) or iso_to_dt(d.get("lastPublishedAt"))
+    created = (
+        iso_to_dt(d.get("createdAt")) or
+        iso_to_dt(d.get("uploaded")) or
+        iso_to_dt(d.get("lastPublishedAt"))
+    )
+
     uploader = (d.get("uploader") or {}).get("name") or (md.get("levelAuthorName") or "")
 
     diffs = []
@@ -103,6 +105,10 @@ def normalize_doc(d):
         label = diff if char == "Standard" else f"{diff} ({char})"
         if label and label not in diffs:
             diffs.append(label)
+
+    # NEW — extract tags (BeatSaver root-level)
+    tags_raw = [str(t).strip() for t in (d.get("tags") or []) if str(t).strip()]
+    tags_lower = [t.lower() for t in tags_raw]
 
     return {
         "uid": uid,
@@ -120,15 +126,16 @@ def normalize_doc(d):
         "preview": v0.get("previewURL") or "",
         "difficulties": diffs,
         "beatsaver_url": f"https://beatsaver.com/maps/{d.get('id')}" if d.get("id") else "",
+        # NEW FIELDS — required by your priority logic
+        "tags": tags_raw,
+        "tags_lower": tags_lower,
     }
 
 
 # ========================
-# *** FETCH YESTERDAY MAPS USING ?before= ***
+# Fetch yesterday using ?before=
 # ========================
-
 def fetch_latest_before(before_iso, max_pages):
-    """Fetch /maps/latest?before=<timestamp> pages newest→older."""
     results = []
     before = before_iso
     for _ in range(max_pages):
@@ -143,22 +150,20 @@ def fetch_latest_before(before_iso, max_pages):
         if not docs:
             break
         results.extend(docs)
-        # update pagination to last map timestamp
         last = docs[-1]
-        ts = iso_to_dt(last.get("createdAt")) or iso_to_dt(last.get("uploaded"))
+        ts = (
+            iso_to_dt(last.get("createdAt")) or
+            iso_to_dt(last.get("uploaded"))
+        )
         if not ts:
             break
         before = ts.isoformat()
-        # stop as soon as we get earlier than we care
-        # (we’ll cut later in main, this just speeds up)
     return results
 
 
 # ========================
-# EMAIL (UNCHANGED!)
+# Email — UNCHANGED EXACTLY
 # ========================
-# We *must not change ANY of this*, since user wants identical HTML.
-
 def build_email(items, label, is_preview=False):
     parts = []
     parts.append("<!doctype html><html><body style=\"font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;font-size:14px;color:#111;margin:0;padding:16px\">")
@@ -222,31 +227,26 @@ def send_email(items, label, is_preview=False):
 
 
 # ========================
-# MAIN — rewritten fully for YESTERDAY LOGIC ONLY
+# MAIN — Yesterday Logic
 # ========================
 def main():
     now_utc = datetime.now(timezone.utc)
     today = now_utc.date()
     yesterday = today - timedelta(days=1)
 
-    # Yesterday window in pure UTC
     start_utc = datetime(yesterday.year, yesterday.month, yesterday.day, tzinfo=timezone.utc)
     end_utc   = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
 
     print("[debug] yesterday window:", start_utc, "→", end_utc)
 
-    # 1) Fetch enough pages newest→older using ?before=
     raw = fetch_latest_before(end_utc.isoformat(), BS_MAX_PAGES)
     print("[debug] raw fetched:", len(raw))
 
-    # 2) Normalize
     items = [normalize_doc(d) for d in raw]
 
-    # Score filter (unchanged)
     if BS_MIN_SCORE > 0:
         items = [x for x in items if (x["score"] is not None and x["score"] >= BS_MIN_SCORE)]
 
-    # 3) Keep only yesterday’s maps
     yest = [
         it for it in items
         if it["created_at"] and start_utc <= it["created_at"] < end_utc
@@ -255,20 +255,19 @@ def main():
 
     print("[debug] yesterday count:", len(yest))
 
-    # 4) Priority vs others
     tagset = set(BS_TAGS)
     priority = []
     others = []
+
     for it in yest:
         if tagset and set(it["tags_lower"]).intersection(tagset):
             priority.append(it)
         else:
             others.append(it)
 
-    # 5) Preview only if no priority maps
     preview = []
     if not priority and tagset:
-        print("[debug] building PREVIEW…")
+        print("[debug] building preview")
         pre_raw = fetch_latest_before(end_utc.isoformat(), 20)
         pre_norm = [normalize_doc(d) for d in pre_raw]
         for it in pre_norm:
@@ -277,29 +276,13 @@ def main():
             if len(preview) >= PREVIEW_LAST_N:
                 break
 
-    # 6) Send final email — **we keep your EXACT HTML**
-    # Build two sections:
-    final_items = []
+    final_items = priority if priority else preview
+    label_priority = "Priority tags: " + ", ".join(BS_TAGS)
 
-    # priority section (if empty → preview)
-    label_priority = "Priority tags: " + ", ".join(BS_TAGS) if BS_TAGS else "Priority"
-    if priority:
-        final_items.extend(priority)
-    else:
-        final_items.extend(preview)
-
-    # other section appended with a visual separator
-    label_others = "Other maps from yesterday"
-    # We do NOT change HTML — so pack items with fake label block
-    # Instead, send two separate emails to preserve formatting EXACTLY
-    # (You want your exact HTML — emails cannot mix two sections cleanly without rewriting HTML)
-
-    # First email: Priority section
     send_email(final_items, label_priority, is_preview=(not priority))
 
-    # Second email: Other maps
     if others:
-        send_email(others, label_others, is_preview=False)
+        send_email(others, "Other maps from yesterday")
 
 
 if __name__ == "__main__":
