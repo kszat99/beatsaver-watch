@@ -187,3 +187,120 @@ def build_email(items, label, is_preview=False):
                 f"<div style='color:#222'>BPM {bpm} · Runtime {runtime} · Rating {score} ({votes})</div>"
                 f"<div style='color:#222;margin-top:4px'>Difficulties: {diffs}</div>"
                 f"<div style='color:#555;margin-top:6px'>{download}{preview}</div>"
+                "</div>"
+                "</div>"
+                "</li>"
+            )
+        parts.append("</ul>")
+    else:
+        parts.append("<p>No maps.</p>")
+    parts.append("</body></html>")
+    html_body = "".join(parts)
+
+    plain = f"Maps for {label}"
+    return f"[BeatSaver] {len(items)} map(s) for {label}", plain, html_body
+
+
+def send_email(items, label, is_preview=False):
+    subject, plain, html = build_email(items, label, is_preview)
+    if DRY_RUN:
+        print("\n[DRY RUN EMAIL]")
+        print(subject)
+        print(html)
+        return
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = GMAIL_USER
+    msg["To"] = EMAIL_TO
+    msg.set_content(plain)
+    msg.add_alternative(html, subtype="html")
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
+        smtp.starttls(context=ctx)
+        smtp.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        smtp.send_message(msg)
+
+
+# ========================
+# MAIN — rewritten fully for YESTERDAY LOGIC ONLY
+# ========================
+def main():
+    now_utc = datetime.now(timezone.utc)
+    today = now_utc.date()
+    yesterday = today - timedelta(days=1)
+
+    # Yesterday window in pure UTC
+    start_utc = datetime(yesterday.year, yesterday.month, yesterday.day, tzinfo=timezone.utc)
+    end_utc   = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
+
+    print("[debug] yesterday window:", start_utc, "→", end_utc)
+
+    # 1) Fetch enough pages newest→older using ?before=
+    raw = fetch_latest_before(end_utc.isoformat(), BS_MAX_PAGES)
+    print("[debug] raw fetched:", len(raw))
+
+    # 2) Normalize
+    items = [normalize_doc(d) for d in raw]
+
+    # Score filter (unchanged)
+    if BS_MIN_SCORE > 0:
+        items = [x for x in items if (x["score"] is not None and x["score"] >= BS_MIN_SCORE)]
+
+    # 3) Keep only yesterday’s maps
+    yest = [
+        it for it in items
+        if it["created_at"] and start_utc <= it["created_at"] < end_utc
+    ]
+    yest.sort(key=lambda it: it["created_at"], reverse=True)
+
+    print("[debug] yesterday count:", len(yest))
+
+    # 4) Priority vs others
+    tagset = set(BS_TAGS)
+    priority = []
+    others = []
+    for it in yest:
+        if tagset and set(it["tags_lower"]).intersection(tagset):
+            priority.append(it)
+        else:
+            others.append(it)
+
+    # 5) Preview only if no priority maps
+    preview = []
+    if not priority and tagset:
+        print("[debug] building PREVIEW…")
+        pre_raw = fetch_latest_before(end_utc.isoformat(), 20)
+        pre_norm = [normalize_doc(d) for d in pre_raw]
+        for it in pre_norm:
+            if set(it["tags_lower"]).intersection(tagset):
+                preview.append(it)
+            if len(preview) >= PREVIEW_LAST_N:
+                break
+
+    # 6) Send final email — **we keep your EXACT HTML**
+    # Build two sections:
+    final_items = []
+
+    # priority section (if empty → preview)
+    label_priority = "Priority tags: " + ", ".join(BS_TAGS) if BS_TAGS else "Priority"
+    if priority:
+        final_items.extend(priority)
+    else:
+        final_items.extend(preview)
+
+    # other section appended with a visual separator
+    label_others = "Other maps from yesterday"
+    # We do NOT change HTML — so pack items with fake label block
+    # Instead, send two separate emails to preserve formatting EXACTLY
+    # (You want your exact HTML — emails cannot mix two sections cleanly without rewriting HTML)
+
+    # First email: Priority section
+    send_email(final_items, label_priority, is_preview=(not priority))
+
+    # Second email: Other maps
+    if others:
+        send_email(others, label_others, is_preview=False)
+
+
+if __name__ == "__main__":
+    main()
